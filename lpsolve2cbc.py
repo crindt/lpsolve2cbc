@@ -3,14 +3,16 @@ from arpeggio import Optional, ZeroOrMore, OneOrMore, EOF, OrderedChoice, NoMatc
 from arpeggio import RegExMatch as _
 from arpeggio import ParserPython, PTNodeVisitor, visit_parse_tree
 import json
-from pprint import pprint
+from pprint import pprint,pformat
 import argparse
 from ortools.linear_solver import pywraplp
 
 
-def number():     return _(r'\d*\.\d*|\d+')
-def factor():     return Optional(["+","-"]), [number, ("(", expression, ")")]
-def term():       return Optional(["+", "-"]), OrderedChoice([(ZeroOrMore([number]), Optional(['*']), varname), number])
+def scinot():     return _(r'\d+\.\d+e\+\d+|\d+e\+\d+')
+def number():     return _(r'\d*\.\d+|\d+')
+def gennum():     return OrderedChoice([scinot,number])
+def factor():     return Optional(["+","-"]), [gennum, ("(", expression, ")")]
+def term():       return Optional(["+", "-"]), OrderedChoice([(ZeroOrMore([gennum]), Optional(['*']), varname), gennum])
 def varname():    return _(r'[a-zA-Z_][a-zA-Z0-9_]*')
 def expr():       return term, ZeroOrMore(OneOrMore(["+", "-"], term))
 def obj():        return _(r'min|max'), ':', expr, ';'
@@ -20,17 +22,12 @@ def vardef():     return _(r'bin|int'), varname, ZeroOrMore(',', varname), ';'
 def prog():       return obj, ZeroOrMore(constr)
 #def calc():       return OneOrMore(expression), EOF
 
-def tt():         return varname, ':', varname, compare, number, ';'
+def tt():         return varname, ':', varname, compare, gennum, ';'
 
 constr_par = ParserPython(constr).parse
 obj_par = ParserPython(obj).parse
 tt_par = ParserPython(constr).parse
 vardef_par = ParserPython(vardef).parse
-#print(parser.parse("min: + 10000 bvarsum  + 500 coachpracstatesum  -0.5 usedfieldsum  + 300 usedcoachsum;"))
-#print(ParserPython(constr).parse("constr_1: B08_White_Toth_o1 = B08_White_Toth_o1_ADAEYADAE + B08_White_Toth_o1_ADAEYADAW + B08_White_Toth_o1_ADAEYBN + B08_White_Toth_o1_ADAEYBS + B08_White_Toth_o1_ADAEYECP4 + B08_White_Toth_o1_ADAWYADAE + B08_White_Toth_o1_ADAWYADAW + B08_White_Toth_o1_ADAWYBN + B08_White_Toth_o1_ADAWYBS + Bj08_White_Toth_o1_ADAWYECP4 + B08_White_Toth_o1_BNYADAE + B08_White_Toth_o1_BNYADAW + B08_White_Toth_o1_BNYBN + B08_White_Toth_o1_BNYBS + B08_White_Toth_o1_BNYECP4 + B08_White_Toth_o1_BSYADAE + B08_White_Toth_o1_BSYADAW + B08_White_Toth_o1_BSYBN + B08_White_Toth_o1_BSYBS + B08_White_Toth_o1_BSYECP4 + B08_White_Toth_o1_ECP4YADAE + B08_White_Toth_o1_ECP4YADAW + B08_White_Toth_o1_ECP4YBN + B08_White_Toth_o1_ECP4YBS + B08_White_Toth_o1_ECP4YECP4;"))
-#cpt = constr_par("c1: -2 one = two;")
-#pprint(cpt)
-#cpt = obj_par("min: -2 one + two;")
 
 
 def addcoeff(obj,term,mult=1):
@@ -52,6 +49,9 @@ class ConstraintVisitor(PTNodeVisitor):
     def visit_number(self, node, children):
         return {'type':'num','val':float(node.value)}
 
+    def visit_scinot(self, node, children):
+        return {'type':'num','val':float(node.value)}
+
     def visit_term(self, node, children):
         if self.debug:
             print("TERM",node)
@@ -65,9 +65,16 @@ class ConstraintVisitor(PTNodeVisitor):
             else:
                 if 'type' in child:
                     if child['type'] == 'num':
+                        if self.debug:
+                            print('COEFF MULT',child['val'], mult,child['val'] * mult)
                         o['coeff'] = child['val'] * mult
                     elif child['type'] == 'var':
+                        if self.debug:
+                            print('COEFF VAR',child['val'])
                         o['var'] = child['val']
+                    else:
+                        print('UNRECOGNIZED TYPE',child['type'])
+                        exit(1)
         if 'coeff' not in o:
             o['coeff'] = 1
         if 'var' not in o:
@@ -159,15 +166,6 @@ class ConstraintVisitor(PTNodeVisitor):
                 o['vars'].append(next['val'])
         return o
 
-#cpt = vardef_par("bin dog, cat, mouse;")
-#ast = visit_parse_tree(cpt, ConstraintVisitor(debug=True))
-#print('ast',ast)
-
-
-#print(tt_par("constr_3400: fielddem_ADAE_mo_1530 <= 4.6 ;"))
-#parser=ParserPython(prog)
-#print(parser.parse(content))
-
 def main():
 
     parser = argparse.ArgumentParser(description='Solve assignment of passenger trips to vehicles, given time windows and resource constraints')
@@ -178,8 +176,14 @@ def main():
                         help='echo MILP to screen')
     parser.add_argument('--debug', dest='debug',action='store_true',
                         help='show debug info')
+    parser.add_argument('--relax-integer', dest='relaxInteger',action='store_true',
+                        help='Remove integer constraints to aid debugging')
+    parser.add_argument('--precision', dest='precision',type=float,
+                        help="Precision with which to test the result")
     parser.set_defaults(echo=False)
     parser.set_defaults(debug=False)
+    parser.set_defaults(relaxInteger=False)
+    parser.set_defaults(precision=1e-7)
     args = parser.parse_args()
 
 
@@ -233,18 +237,20 @@ def main():
     allvar={}
     for var, coeff in prog['obj']['left'].items():
         if var != 'CONSTANT':
-            allvar[var] = 'free'
+            allvar[var] = 'gtzero'
     for constr in prog['constr']:
         for var, coeff in constr['left'].items():
             if var != 'CONSTANT':
-                allvar[var] = 'free'
+                allvar[var] = 'gtzero,'
     for vd in vardefs:
         for var in vd['vars']:
             if var != 'CONSTANT':
                 if vd['type'] == 'bin':
-                    allvar[var] = 'bin'
+                    allvar[var] = allvar[var]+'bin'
                 elif vd['type'] == 'int':
-                    allvar[var] = 'int'
+                    allvar[var] = allvar[var]+'int'
+                elif vd['type'] == 'free':
+                    allvar[var] = 'free,'+allvar[var].replace("gtzero","")
                 else:
                     raise Exception("UNKNOWN VARTYPE "+vd['type'])
 
@@ -255,12 +261,32 @@ def main():
                              pywraplp.Solver.CBC_MIXED_INTEGER_PROGRAMMING)
     for varname,vartype in allvar.items():
         if varname != 'CONSTANT':
-            if vartype == 'int':
-                allvar[varname] = solver.IntVar(0.0, solver.infinity(), varname)
-            elif vartype == 'bin':
-                allvar[varname] = solver.IntVar(0.0, 1.0, varname)
+            if re.match('.*int.*',vartype):
+                low = 0
+                hi  = solver.infinity()
+                if re.match(r'.*free.*',vartype): low = -solver.infinity()
+                if args.relaxInteger:
+                    allvar[varname] = solver.NumVar(low, hi, varname)
+                else:
+                    allvar[varname] = solver.IntVar(low, hi, varname)
+                # print ("[%s] INTVAR %s: %f, %f" % (vartype, varname, low, solver.infinity()))
+
+            elif re.match(r'.*bin.*',vartype) and re.match(r'.*free.*',vartype):
+                raise Exception("Can't declare variable "+vartype+" as both free and bin")
+
+            elif re.match(r'.*bin.*',vartype):
+                if args.relaxInteger:
+                    allvar[varname] = solver.NumVar(0.0, 1.0, varname)
+                else:
+                    allvar[varname] = solver.IntVar(0.0, 1.0, varname)
+                # print ("[%s] BINVAR %s: %f, %f" % (vartype, varname, 0, 1))
+
             else:
+                low = 0
+                hi  = solver.infinity()
+                if re.match(r'free',vartype): low = -solver.infinity()
                 allvar[varname] = solver.NumVar(0,solver.infinity(),varname)
+                # print ("[%s] NUMVAR %s: %f, %f" % (vartype, varname, low, hi))
     
     def coeff_fn(vardict,name,default=0):
         if name in vardict:
@@ -269,11 +295,14 @@ def main():
             return default
 
 
+    varstat = {}
     objective = solver.Objective()
     dumps = ""
     for varname, coeff in prog['obj']['left'].items():
         if varname != 'CONSTANT':
             objective.SetCoefficient(allvar[varname],coeff)
+            if coeff != 0 and varname not in varstat.keys():
+                varstat[varname] = { 'obj': True, 'constr': [] }
             dumps += " + (%f) %s" % (coeff,varname)
 
     if prog['obj']['obj'] == 'min':
@@ -308,8 +337,19 @@ def main():
             if ( varname != "CONSTANT" ):
                 allconstr[constr['name']].SetCoefficient(allvar[varname],coeff)
                 dumps += " + (%f) %s" % (coeff,varname)
+                if varname not in varstat.keys():
+                    varstat[varname] = { 'obj': False, 'constr': [] }
+                varstat[varname]['constr'].append(constr['name'])
+                
         if args.echo:
             print ("%s: %s %s %f;" % (constr['name'],dumps,constr['compare'],bound))
+
+
+    # check if all vars in objective exist in contraints
+    for varname,vs in varstat.items():
+        if vs['obj'] and len(vs['constr']) == 0:
+            raise Exception("Variable "+varname+" in objective but not in any constraints "+pformat(vs))
+
 
     result_status = solver.Solve()
 
@@ -322,15 +362,15 @@ def main():
         5: 'model_invalid',
         6: 'not_solved'
     }
-    print('RESULT STATUS', repr(result_status),'=',resdict[result_status])
-
+    if ( result_status != pywraplp.Solver.OPTIMAL ):
+         print('RESULT STATUS', repr(result_status),'=',resdict[result_status])
 
     # The problem has an optimal solution.
     assert result_status == pywraplp.Solver.OPTIMAL
 
     # The solution looks legit (when using solvers other than
     # GLOP_LINEAR_PROGRAMMING, verifying the solution is highly recommended!).
-    assert solver.VerifySolution(1e-7, True)
+    assert solver.VerifySolution(args.precision, True)
 
 #    print('Number of variables =', solver.NumVariables())
 #    print('Number of constraints =', solver.NumConstraints())
